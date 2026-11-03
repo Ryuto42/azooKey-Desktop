@@ -24,6 +24,8 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
     private var lastPredictionCandidates: [String] = []
     private var lastPredictionUpdateTime: TimeInterval = 0
     private var predictionHideWorkItem: DispatchWorkItem?
+    /// 入力が止まったときの再変換
+    private let pauseReconversion = DebouncedActionScheduler()
 
     private var replaceSuggestionWindow: NSWindow
     private var replaceSuggestionsViewController: ReplaceSuggestionsViewController
@@ -295,6 +297,27 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
 
         let userAction = UserAction.getUserAction(eventCore: event.keyEventCore, inputLanguage: inputLanguage)
 
+        // 確定直後のCtrl+Deleteは確定の取り消し。それ以外のキーが来たら取り消せなくする
+        if case .forget = userAction, self.inputState == .none, self.inputLanguage == .japanese, self.undoLastCommit(client: client) {
+            return true
+        }
+        self.segmentsManager.discardLastCommit()
+
+        // 開き括弧で終わる入力中の文字列に続きを打ったら、括弧を閉じて確定し、続きは括弧の中に入れる
+        let continuesTyping = switch userAction {
+        case .input, .number: true
+        default: false
+        }
+        if continuesTyping, self.inputState == .composing, self.inputLanguage == .japanese,
+           let last = self.segmentsManager.getCurrentMarkedText(inputState: self.inputState).map(\.content).joined().last,
+           BracketPair.closing(for: String(last)) != nil {
+            let text = self.segmentsManager.commitMarkedText(inputState: self.inputState)
+            self.insertClosingBracket(after: text, client: client, keepsTyping: true)
+            self.inputState = .none
+            self.refreshMarkedText()
+            self.refreshCandidateWindow()
+        }
+
         // 英数キー（keyCode 102）の処理
         if event.keyCode == 102 {
             let isDoubleTap = checkAndUpdateDoubleTap(keyCode: 102)
@@ -398,8 +421,10 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
             self.segmentsManager.insertCompositionSeparator(inputStyle: self.inputStyle, skipUpdate: false)
             self.segmentsManager.requestSetCandidateWindowState(visible: false)
         case .enterCandidateSelectionMode:
+            let shownText = self.segmentsManager.getCurrentMarkedText(inputState: self.inputState).map(\.content).joined()
             self.segmentsManager.insertCompositionSeparator(inputStyle: self.inputStyle, skipUpdate: true)
             self.segmentsManager.update(requestRichCandidates: true)
+            self.segmentsManager.enterCandidateSelection(liveText: shownText)
         case .appendToMarkedText(let string):
             // 英語モードの場合は.directでローマ字変換せずそのまま入力
             let inputStyle: InputStyle = self.inputLanguage == .english ? .direct : self.inputStyle
@@ -414,7 +439,7 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
             self.segmentsManager.editSegment(count: count)
         case .commitMarkedText:
             let text = self.segmentsManager.commitMarkedText(inputState: self.inputState)
-            client.insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
+            self.insertClosingBracket(after: text, client: client, keepsTyping: false)
         case .commitMarkedTextAndAppendToMarkedText(let string):
             let text = self.segmentsManager.commitMarkedText(inputState: self.inputState)
             client.insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
@@ -430,10 +455,17 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
         case .submitSelectedCandidate:
             self.submitSelectedCandidate()
         case .removeLastMarkedText:
-            self.segmentsManager.deleteBackwardFromCursorPosition()
+            self.segmentsManager.deleteBackwardFromCursorPosition(keepsLiveConversion: self.inputState == .composing)
             self.segmentsManager.requestResettingSelection()
         case .selectPrevCandidate:
             self.segmentsManager.requestSelectingPrevCandidate()
+        case .selectPrevCandidateWrapping:
+            if self.inputState != .selecting {
+                self.segmentsManager.insertCompositionSeparator(inputStyle: self.inputStyle, skipUpdate: true)
+                self.segmentsManager.update(requestRichCandidates: true)
+                self.segmentsManager.requestResettingSelection()
+            }
+            self.segmentsManager.selectPrevCandidateWrapping()
         case .selectNextCandidate:
             self.segmentsManager.requestSelectingNextCandidate()
         case .selectCandidatePage(let count):
@@ -560,8 +592,28 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
         self.refreshMarkedText()
         self.refreshCandidateWindow()
         self.refreshPredictionWindow()
+        self.schedulePauseReconversion()
         return true
     }
+
+    /// 入力中のまま打鍵が止まったら、推論を増やして変換し直す
+    @MainActor private func schedulePauseReconversion() {
+        guard self.inputState == .composing else {
+            self.pauseReconversion.cancel()
+            return
+        }
+        let reading = self.segmentsManager.convertTarget
+        self.pauseReconversion.schedule(after: Self.pauseReconversionDelay) { [weak self] in
+            guard let self, self.inputState == .composing, self.segmentsManager.convertTarget == reading else {
+                return
+            }
+            if self.segmentsManager.reconvertAfterPause() {
+                self.refreshMarkedText()
+            }
+        }
+    }
+
+    private static let pauseReconversionDelay: TimeInterval = 1.0
 
     @MainActor func switchInputLanguage(_ language: InputLanguage, client: IMKTextInput) {
         self.inputLanguage = language
@@ -786,11 +838,67 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
     func submitCandidate(_ candidate: Candidate) {
         if let client = self.client() {
             // インサートを行う前にコンテキストを取得する
-            let cleanLeftSideContext = self.segmentsManager.getCleanLeftSideContext(maxCount: 30)
-            client.insertText(candidate.text, replacementRange: NSRange(location: NSNotFound, length: 0))
+            let cleanLeftSideContext = self.segmentsManager.getCleanLeftSideContext()
+            let pendingClosingBracket = self.segmentsManager.pendingClosingBracket
+            if BracketPair.closing(for: self.segmentsManager.convertTarget) != nil {
+                // 開き括弧だけの入力を、Spaceで選んだ括弧（『【（など）で確定する
+                self.insertClosingBracket(after: candidate.text, client: client, keepsTyping: false)
+            } else {
+                client.insertText(candidate.text, replacementRange: NSRange(location: NSNotFound, length: 0))
+            }
             // アプリケーションサポートのディレクトリを準備しておく
             self.segmentsManager.prefixCandidateCommited(candidate, leftSideContext: cleanLeftSideContext ?? "")
+            if let pendingClosingBracket, self.segmentsManager.isEmpty {
+                // 待っていた閉じ括弧は、最後の文節と一緒に確定する
+                client.insertText(pendingClosingBracket, replacementRange: NSRange(location: NSNotFound, length: 0))
+                self.segmentsManager.pendingClosingBracket = nil
+            }
         }
+    }
+
+    /// `text`を確定する。開き括弧で終わっていれば閉じ括弧も入れる。
+    /// 確定する位置やカーソル位置の指定を反映しないアプリ（Electronなど）もあるため、文字列は常にカーソルの位置に確定する。
+    /// - parameter keepsTyping: 続けて打つ文字の確定。閉じ括弧は次の入力中の文字列の後ろに表示し、その入力と一緒に確定する
+    private func insertClosingBracket(after text: String, client: IMKTextInput, keepsTyping: Bool) {
+        guard let last = text.last, let closing = BracketPair.closing(for: String(last)) else {
+            client.insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
+            return
+        }
+        if keepsTyping {
+            client.insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
+            self.segmentsManager.pendingClosingBracket = closing
+        } else {
+            client.insertText(text + closing, replacementRange: NSRange(location: NSNotFound, length: 0))
+        }
+    }
+
+    /// 直前に確定した文字列がカーソルの直前にあれば、それを読みのmarked textに置き換えて入力中に戻す
+    @MainActor
+    private func undoLastCommit(client: IMKTextInput) -> Bool {
+        guard let commit = self.segmentsManager.lastCommit, !commit.text.isEmpty, self.segmentsManager.isEmpty else {
+            return false
+        }
+        let selectedRange = client.selectedRange()
+        let length = commit.text.utf16.count
+        guard selectedRange.location != NSNotFound, selectedRange.length == 0, selectedRange.location >= length else {
+            return false
+        }
+        let committedRange = NSRange(location: selectedRange.location - length, length: length)
+        var actualRange = NSRange()
+        guard client.string(from: committedRange, actualRange: &actualRange) == commit.text else {
+            return false
+        }
+        client.setMarkedText(
+            NSAttributedString(string: commit.reading),
+            selectionRange: NSRange(location: commit.reading.utf16.count, length: 0),
+            replacementRange: committedRange
+        )
+        self.segmentsManager.undoLastCommit()
+        self.inputState = .composing
+        self.refreshMarkedText()
+        self.refreshCandidateWindow()
+        self.refreshPredictionWindow()
+        return true
     }
 
     @MainActor

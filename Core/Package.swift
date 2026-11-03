@@ -1,6 +1,7 @@
 // swift-tools-version: 6.1
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
+import Foundation
 import PackageDescription
 
 #if os(macOS)
@@ -9,6 +10,14 @@ let kanaKanjiConverterTraits: Set<Package.Dependency.Trait> = ["Zenzai"]
 // for testing in Ubuntu environment.
 let kanaKanjiConverterTraits: Set<Package.Dependency.Trait> = []
 #endif
+
+// Kashiko の機能を入れた変換エンジンのフォーク。リポジトリと並べて clone してあれば、手元の変更をそのまま使う
+let localKanaKanjiConverterPath = "../../AzooKeyKanaKanjiConverter"
+let kanaKanjiConverterDependency: Package.Dependency = FileManager.default.fileExists(
+    atPath: URL(fileURLWithPath: Context.packageDirectory).appendingPathComponent(localKanaKanjiConverterPath).appendingPathComponent("Package.swift").path
+)
+    ? .package(path: localKanaKanjiConverterPath, traits: kanaKanjiConverterTraits)
+    : .package(url: "https://github.com/Ryuto42/AzooKeyKanaKanjiConverter", branch: "feature/smart-input", traits: kanaKanjiConverterTraits)
 
 let products: [Product] = [
     // Products define the executables and libraries a package produces, making them visible to other packages.
@@ -52,7 +61,7 @@ let package = Package(
     platforms: [.macOS(.v13)],
     products: products,
     dependencies: [
-        .package(url: "https://github.com/azooKey/AzooKeyKanaKanjiConverter", revision: "04ce2ec3afe2bd6f92fcae1dc15a2357d332c27a", traits: kanaKanjiConverterTraits),
+        kanaKanjiConverterDependency,
         .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"),
         .package(url: "https://github.com/weichsel/ZIPFoundation.git", from: "0.9.0")
     ],

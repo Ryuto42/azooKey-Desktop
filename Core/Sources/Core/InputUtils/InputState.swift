@@ -181,7 +181,9 @@ public enum InputState: Sendable, Hashable {
             case .かな:
                 return (.selectInputLanguage(.japanese), .fallthrough)
             case .navigation(let direction):
-                if direction == .down {
+                if direction == .up {
+                    return (.selectPrevCandidateWrapping, .transition(.selecting))
+                } else if direction == .down {
                     return (.enterCandidateSelectionMode, .transition(.selecting))
                 } else if direction == .right && event.modifierFlags.contains(.shift) {
                     return (.editSegment(1), .transition(.selecting))
@@ -242,7 +244,9 @@ public enum InputState: Sendable, Hashable {
             case .forget, .tab:
                 return (.consume, .fallthrough)
             case .navigation(let direction):
-                if direction == .down {
+                if direction == .up {
+                    return (.selectPrevCandidateWrapping, .transition(.selecting))
+                } else if direction == .down {
                     return (.enterCandidateSelectionMode, .transition(.selecting))
                 } else if direction == .right && event.modifierFlags.contains(.shift) {
                     return (.editSegment(1), .transition(.selecting))
@@ -303,7 +307,7 @@ public enum InputState: Sendable, Hashable {
                 } else if direction == .down {
                     return (.selectNextCandidate, .fallthrough)
                 } else if direction == .up {
-                    return (.selectPrevCandidate, .fallthrough)
+                    return (.selectPrevCandidateWrapping, .fallthrough)
                 } else {
                     return (.consume, .fallthrough)
                 }

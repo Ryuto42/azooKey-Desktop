@@ -24,6 +24,8 @@ public enum ClientAction {
     case submitSelectedCandidate
     case selectNextCandidate
     case selectPrevCandidate
+    /// ↑キー：一つ前の候補。先頭からは末尾（ひらがな、その前がカタカナ）に回る
+    case selectPrevCandidateWrapping
     case selectCandidatePage(Int)
     case selectNumberCandidate(Int)
 

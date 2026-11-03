@@ -81,6 +81,18 @@ public final class SegmentsManager {
     private var suggestSelectionIndex: Int?
     private var backspaceAdjustedPredictionCandidate: PredictionCandidate?
     private var backspaceTypoCorrectionLock: BackspaceTypoCorrectionLock?
+    private var backspaceConversionView: BackspaceConversionView?
+
+    /// 確定した文字列と、その確定で学習した候補。
+    public struct CommittedText: Sendable {
+        public var reading: String
+        public var text: String
+        var learnedCandidates: [Candidate]
+    }
+    /// 現在の入力のうち、すでに確定した部分
+    private var pendingCommit: CommittedText?
+    /// 直前に完了した入力の確定内容。取り消しの対象になる
+    public private(set) var lastCommit: CommittedText?
 
     public struct PredictionCandidate: Sendable, Equatable {
         public var displayText: String
@@ -140,7 +152,10 @@ public final class SegmentsManager {
     }
 
     private enum ContextLength {
-        static let conversion = 30
+        /// クライアントに要求する長さ（UTF-16）。前の行まで届くよう長めに取る
+        static let conversion = 160
+        /// 行を結合した後に残す文字数
+        static let keptLeftCharacters = 64
     }
 
     public func appendDebugMessage(_ string: String) {
@@ -162,14 +177,15 @@ public final class SegmentsManager {
     private func zenzaiMode(
         leftSideContext: String?,
         rightSideContext: String?,
-        requestRichCandidates: Bool
+        requestRichCandidates: Bool,
+        inferenceLimit: Int? = nil
     ) -> ConvertRequestOptions.ZenzaiMode {
         if !self.context.useZenzai {
             return .off
         }
         return .on(
             weight: self.resourcesDirectoryURL.appendingPathComponent("ggml-model-Q5_K_M.gguf", isDirectory: false),
-            inferenceLimit: Config.ZenzaiInferenceLimit().value,
+            inferenceLimit: inferenceLimit ?? Config.ZenzaiInferenceLimit().value,
             requestRichCandidates: requestRichCandidates,
             personalizationMode: self.zenzaiPersonalizationMode,
             versionDependentMode: .v3(
@@ -208,7 +224,8 @@ public final class SegmentsManager {
         rightSideContext: String?,
         requestRichCandidates: Bool,
         requireJapanesePrediction: ConvertRequestOptions.PredictionMode,
-        requireEnglishPrediction: ConvertRequestOptions.PredictionMode
+        requireEnglishPrediction: ConvertRequestOptions.PredictionMode,
+        inferenceLimit: Int? = nil
     ) -> ConvertRequestOptions {
         .init(
             requireJapanesePrediction: requireJapanesePrediction,
@@ -224,7 +241,8 @@ public final class SegmentsManager {
             zenzaiMode: self.zenzaiMode(
                 leftSideContext: leftSideContext,
                 rightSideContext: rightSideContext,
-                requestRichCandidates: requestRichCandidates
+                requestRichCandidates: requestRichCandidates,
+                inferenceLimit: inferenceLimit
             ),
             experimentalZenzaiPredictiveInput: true,
             typoCorrectionMode: .automatic,
@@ -286,11 +304,14 @@ public final class SegmentsManager {
         self.backspaceAdjustedPredictionCandidate = nil
         self.backspaceTypoCorrectionLock = nil
         self.lastInputStyle = .direct
+        self.pendingCommit = nil
+        self.lastCommit = nil
     }
 
     @MainActor
     /// この入力を打ち切る
     public func stopComposition() {
+        self.pendingClosingBracket = nil
         self.composingText.stopComposition()
         self.withConverter { $0.stopComposition() }
         self.rawCandidates = nil
@@ -302,6 +323,7 @@ public final class SegmentsManager {
         self.backspaceAdjustedPredictionCandidate = nil
         self.backspaceTypoCorrectionLock = nil
         self.lastInputStyle = .direct
+        self.pendingCommit = nil
     }
 
     @MainActor
@@ -317,6 +339,8 @@ public final class SegmentsManager {
         self.backspaceAdjustedPredictionCandidate = nil
         self.backspaceTypoCorrectionLock = nil
         self.lastInputStyle = .direct
+        self.pendingCommit = nil
+        self.lastCommit = nil
     }
 
     /// 変換キーを押したタイミングで入力の区切りを示す
@@ -336,6 +360,7 @@ public final class SegmentsManager {
 
     @MainActor
     public func insertAtCursorPosition(_ string: String, inputStyle: InputStyle) {
+        self.beginCompositionIfNeeded()
         self.lastInputStyle = inputStyle
         self.composingText.insertAtCursorPosition(string, inputStyle: inputStyle)
         self.lastOperation = .insert
@@ -346,6 +371,7 @@ public final class SegmentsManager {
 
     @MainActor
     public func insertAtCursorPosition(pieces: [InputPiece], inputStyle: InputStyle) {
+        self.beginCompositionIfNeeded()
         self.lastInputStyle = inputStyle
         self.composingText.insertAtCursorPosition(pieces.map { .init(piece: $0, inputStyle: inputStyle) })
         self.lastOperation = .insert
@@ -385,8 +411,19 @@ public final class SegmentsManager {
         self.updateRawCandidate()
     }
 
+    private func beginCompositionIfNeeded() {
+        if self.composingText.isEmpty {
+            self.pendingCommit = nil
+            self.lastCommit = nil
+        }
+    }
+
+    /// - parameter keepsLiveConversion: ライブ変換を表示している状態からの削除なら`true`。削除の起点で表示していた変換を手前の部分に残す。
     @MainActor
-    public func deleteBackwardFromCursorPosition(count: Int = 1) {
+    public func deleteBackwardFromCursorPosition(count: Int = 1, keepsLiveConversion: Bool = false) {
+        if self.lastOperation != .delete {
+            self.backspaceConversionView = keepsLiveConversion ? self.currentBackspaceConversionView() : nil
+        }
         var previousComposingText = self.composingText.prefixToCursorPosition()
         if !self.composingText.isAtEndIndex {
             // 右端に持っていく
@@ -396,6 +433,10 @@ public final class SegmentsManager {
             previousComposingText = self.composingText.prefixToCursorPosition()
         }
         self.composingText.deleteBackwardFromCursorPosition(count: count)
+        if self.composingText.isEmpty {
+            // 括弧の中を消し切ったら、待っていた閉じ括弧も入れない
+            self.pendingClosingBracket = nil
+        }
         self.lastOperation = .delete
         // ライブ変換がオフの場合は変換候補ウィンドウを出したい
         self.shouldShowCandidateWindow = !self.liveConversionEnabled
@@ -434,6 +475,20 @@ public final class SegmentsManager {
         }
     }
 
+    private func currentBackspaceConversionView() -> BackspaceConversionView? {
+        guard self.liveConversionEnabled,
+              self.composingText.isAtEndIndex,
+              self.composingText.convertTarget.count > 1,
+              let firstCandidate = self.rawCandidates?.mainResults.first else {
+            return nil
+        }
+        return BackspaceConversionView(
+            reading: self.composingText.convertTarget,
+            text: firstCandidate.text,
+            words: firstCandidate.data.map { ($0.ruby, $0.word) }
+        )
+    }
+
     @MainActor
     public func forgetMemory() {
         if let selectedCandidate {
@@ -454,6 +509,25 @@ public final class SegmentsManager {
     }
 
     private var rawCandidatesList: [Candidate]? {
+        self.unorderedRawCandidatesList.map(self.kanaCandidatesLast)
+    }
+
+    /// 入力全体をカタカナ・ひらがなにした候補を、この順で末尾に置く。Spaceでは出ず、↑で末尾に回るとひらがな、カタカナの順に出る
+    private func kanaCandidatesLast(_ candidates: [Candidate]) -> [Candidate] {
+        let reading = self.composingText.convertTarget
+        func isWhole(_ candidate: Candidate, _ text: String) -> Bool {
+            candidate.text == text && self.composingText.isWholeComposingText(composingCount: candidate.composingCount)
+        }
+        let kana = [reading.toKatakana(), reading.toHiragana()].compactMap { text in
+            candidates.first { isWhole($0, text) }
+        }
+        guard !kana.isEmpty else {
+            return candidates
+        }
+        return candidates.filter { candidate in !kana.contains { $0.text == candidate.text } } + kana
+    }
+
+    private var unorderedRawCandidatesList: [Candidate]? {
         guard let rawCandidates else {
             return nil
         }
@@ -499,15 +573,33 @@ public final class SegmentsManager {
         self.composingText.isEmpty
     }
 
+    public func getCleanLeftSideContext() -> String? {
+        self.getCleanLeftSideContext(maxCount: ContextLength.conversion)
+    }
+
     public func getCleanLeftSideContext(maxCount: Int) -> String? {
         self.delegate?.getLeftSideContext(maxCount: maxCount).map {
-            var last = $0.split(separator: "\n", omittingEmptySubsequences: false).last ?? $0[...]
-            // 前方の空白を削除する
-            while last.first?.isWhitespace ?? false {
-                last = last.dropFirst()
-            }
-            return String(last)
+            String(Self.joinContextLines($0).suffix(ContextLength.keptLeftCharacters))
         }
+    }
+
+    /// 前の行も左文脈に残し、改行を文の区切りとして扱う。
+    /// 文末記号で終わっていない行には「。」を補い、空行は捨てる。
+    static func joinContextLines(_ text: String) -> String {
+        let lines = text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+        var result = ""
+        for (index, line) in lines.enumerated() {
+            if index > 0, let last = result.last, !"。．.！？!?」』）)…".contains(last) {
+                result.append("。")
+            }
+            if index == lines.count - 1 {
+                // 入力中の行は、カーソル直前の空白を残す
+                result += line.drop(while: \.isWhitespace)
+            } else {
+                result += line.trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return result
     }
 
     public func getCleanRightSideContext(maxCount: Int) -> String? {
@@ -536,7 +628,8 @@ public final class SegmentsManager {
     @MainActor private func updateRawCandidate(
         requestRichCandidates: Bool = false,
         forcedLeftSideContext: String? = nil,
-        forcedRightSideContext: String? = nil
+        forcedRightSideContext: String? = nil,
+        inferenceLimit: Int? = nil
     ) {
         if self.lastOperation != .delete {
             self.backspaceAdjustedPredictionCandidate = nil
@@ -583,19 +676,86 @@ public final class SegmentsManager {
 
         let leftSideContext = forcedLeftSideContext ?? self.getCleanLeftSideContext(maxCount: ContextLength.conversion)
         let rightSideContext = forcedRightSideContext ?? self.getCleanRightSideContext(maxCount: ContextLength.conversion)
+        let addsSeparator = self.endsWithPendingN
+        if self.convertedWithAddedSeparator && !addsSeparator {
+            // 区切りを足した入力の変換結果は、次の入力の差分変換の元にできない
+            self.withConverter { $0.stopComposition() }
+        }
+        self.convertedWithAddedSeparator = addsSeparator
         let result = self.withConverter { converter in
             converter.requestCandidates(
-                self.composingText,
+                self.composingTextForConversion,
                 options: options(
                     leftSideContext: leftSideContext,
                     rightSideContext: rightSideContext,
                     requestRichCandidates: requestRichCandidates,
                     requireJapanesePrediction: Config.DebugPredictiveTyping().value ? .manualMix : .disabled,
-                    requireEnglishPrediction: Config.DebugPredictiveTyping().value ? .manualMix : .disabled
+                    requireEnglishPrediction: Config.DebugPredictiveTyping().value ? .manualMix : .disabled,
+                    inferenceLimit: inferenceLimit
                 )
             )
         }
         self.rawCandidates = result
+    }
+
+    /// 入力が止まったときに、推論の回数を増やして変換し直す。新しい変換が今の表示より
+    /// モデルの採点で一定以上自然なときだけ表示を差し替え、`true`を返す。
+    @MainActor public func reconvertAfterPause() -> Bool {
+        guard self.context.useZenzai, self.liveConversionEnabled, self.lastOperation == .insert,
+              self.composingText.isAtEndIndex, self.composingText.convertTarget.count > 1,
+              let previous = self.rawCandidates, let current = previous.mainResults.first else {
+            return false
+        }
+        let input = self.composingTextForConversion
+        // 打鍵の途中で決まった先頭の制約を外し、最初から推論し直す
+        self.withConverter { $0.stopComposition() }
+        self.updateRawCandidate(inferenceLimit: Self.pauseInferenceLimit)
+        guard let reconverted = self.rawCandidates?.mainResults.first, reconverted.text != current.text else {
+            return false
+        }
+        let options = self.options(
+            leftSideContext: self.getCleanLeftSideContext(maxCount: ContextLength.conversion),
+            rightSideContext: self.getCleanRightSideContext(maxCount: ContextLength.conversion),
+            requestRichCandidates: false,
+            requireJapanesePrediction: .disabled,
+            requireEnglishPrediction: .disabled
+        )
+        let scores = self.withConverter { converter in
+            (
+                converter.zenzaiLogProbability(of: reconverted, for: input, options: options),
+                converter.zenzaiLogProbability(of: current, for: input, options: options)
+            )
+        }
+        guard let new = scores.0, let old = scores.1, new - old >= Self.pauseAcceptanceMargin else {
+            self.rawCandidates = previous
+            return false
+        }
+        return true
+    }
+
+    /// 入力停止後の再変換で使う推論の回数
+    static let pauseInferenceLimit = 10
+    /// 再変換の結果を採用するのに必要な、モデルの対数確率の差
+    static let pauseAcceptanceMargin: Float = 1.0
+
+    /// 末尾の未確定の`n`は「ん」として変換する（Spaceで変換したときと同じ）。入力そのものは変えない。
+    private var composingTextForConversion: ComposingText {
+        guard self.endsWithPendingN else {
+            return self.composingText
+        }
+        var text = self.composingText
+        text.insertAtCursorPosition([.init(piece: .compositionSeparator, inputStyle: self.lastInputStyle)])
+        return text
+    }
+
+    /// 直前の変換で、末尾の`n`のために区切りを足したか
+    private var convertedWithAddedSeparator = false
+
+    private var endsWithPendingN: Bool {
+        self.composingText.isAtEndIndex
+            && self.composingText.convertTarget.hasSuffix("n")
+            && self.lastInputStyle != .direct
+            && self.composingText.input.last?.piece != .compositionSeparator
     }
 
     @MainActor public func update(requestRichCandidates: Bool) {
@@ -607,7 +767,22 @@ public final class SegmentsManager {
     @MainActor public func prefixCandidateCommited(_ candidate: Candidate, leftSideContext: String) {
         self.withConverter { $0.setCompletedData(candidate) }
         self.withConverter { $0.updateLearningData(candidate) }
+        if self.endsWithPendingN {
+            // 候補は末尾の`n`を「ん」とした入力に対するものなので、入力をそれに揃える
+            self.composingText.insertAtCursorPosition([.init(piece: .compositionSeparator, inputStyle: self.lastInputStyle)])
+        }
+        let previousConvertTarget = self.composingText.convertTarget
         self.composingText.prefixComplete(composingCount: candidate.composingCount)
+        self.recordCommit(
+            reading: String(previousConvertTarget.prefix(previousConvertTarget.count - self.composingText.convertTarget.count)),
+            text: candidate.text,
+            learnedCandidate: candidate
+        )
+        if self.composingText.isEmpty {
+            // Spaceで入れた区切りが残っていると、次に打つ`n`が区切りの後ろで「ん」に確定してしまう
+            self.composingText.stopComposition()
+            self.finishCommit()
+        }
 
         if !self.composingText.isEmpty {
             // カーソルを右端に移動する
@@ -636,7 +811,13 @@ public final class SegmentsManager {
     @MainActor
     public func requestSelectingNextCandidate() {
         self.isFixingAdditionalCandidateTop = false
-        self.selectionIndex = (self.selectionIndex ?? -1) + 1
+        let next = (self.selectionIndex ?? -1) + 1
+        // 最後の候補の次は先頭に戻る
+        if let count = self.candidates?.count, count > 0, next >= count {
+            self.selectionIndex = 0
+        } else {
+            self.selectionIndex = next
+        }
     }
 
     @MainActor
@@ -693,6 +874,60 @@ public final class SegmentsManager {
 
     public func stopSuggestionSelection() {
         self.selectionIndex = nil
+    }
+
+    /// 選んだ文節より後ろの読みを、文全体の変換と同じ表記で返す。読みが文全体の変換の後半と一致しなければ`nil`
+    private func convertedRemainder(reading: String) -> String? {
+        guard self.liveConversionEnabled, !reading.isEmpty, let whole = self.rawCandidates?.mainResults.first else {
+            return nil
+        }
+        let target = reading.toKatakana()
+        for start in whole.data.indices {
+            let rest = whole.data[start...]
+            if rest.map(\.ruby).joined() == target {
+                return rest.map(\.word).joined()
+            }
+        }
+        return nil
+    }
+
+    /// Space・↓で候補の選択を始めたときに呼ぶ。先頭の候補を選んだ表示が直前の表示と同じなら、
+    /// 先頭と同じ範囲（文節）で表示の変わる次の候補を選ぶ。そのような候補がなければ先頭のままにする。
+    @MainActor
+    public func enterCandidateSelection(liveText: String) {
+        guard let candidates, candidates.count > 1,
+              self.getCurrentMarkedText(inputState: .selecting).map(\.content).joined() == liveText else {
+            return
+        }
+        func remainingReading(_ candidate: Candidate) -> String {
+            var rest = self.composingText
+            rest.prefixComplete(composingCount: candidate.composingCount)
+            return rest.convertTarget
+        }
+        // ローマ字がかなにならず残った候補（`ありがtぷ`）は、表示に英字がないときは選ばない
+        let isLatin: (Character) -> Bool = { ($0.isASCII && $0.isLetter) || ("Ａ" ... "ｚ").contains($0) }
+        let allowsLatin = liveText.contains(where: isLatin)
+        let firstRemainder = remainingReading(candidates[0])
+        // 末尾に置いたひらがな・カタカナの候補は↑で選ぶもので、Spaceでは選ばない
+        let kana: Set<String> = [self.composingText.convertTarget.toHiragana(), self.composingText.convertTarget.toKatakana()]
+        for index in candidates.indices.dropFirst() where remainingReading(candidates[index]) == firstRemainder
+            && (allowsLatin || !candidates[index].text.contains(where: isLatin))
+            && !kana.contains(candidates[index].text) {
+            self.selectionIndex = index
+            if self.getCurrentMarkedText(inputState: .selecting).map(\.content).joined() != liveText {
+                return
+            }
+        }
+        self.selectionIndex = 0
+    }
+
+    /// ↑キーで一つ前の候補を選ぶ。選び始めや先頭からは末尾（ひらがな、その前がカタカナ）に回る
+    @MainActor public func selectPrevCandidateWrapping() {
+        guard let candidates, !candidates.isEmpty else {
+            return
+        }
+        let index = self.selectionIndex ?? 0
+        self.selectionIndex = index == 0 ? candidates.count - 1 : index - 1
     }
 
     public func requestResettingSelection() {
@@ -865,11 +1100,61 @@ public final class SegmentsManager {
     public func commitMarkedText(inputState: InputState) -> String {
         let markedText = self.getCurrentMarkedText(inputState: inputState)
         let text = markedText.reduce(into: "") {$0.append(contentsOf: $1.content)}
-        if let candidate = self.candidates?.first(where: {$0.text == text}) {
-            self.prefixCandidateCommited(candidate, leftSideContext: "")
+        let candidate = self.candidates?.first(where: {$0.text == text})
+        if let candidate {
+            self.withConverter { $0.setCompletedData(candidate) }
+            self.withConverter { $0.updateLearningData(candidate) }
         }
+        self.recordCommit(reading: self.composingText.convertTarget, text: text, learnedCandidate: candidate)
+        self.finishCommit()
         self.stopComposition()
         return text
+    }
+
+    private func recordCommit(reading: String, text: String, learnedCandidate: Candidate?) {
+        var commit = self.pendingCommit ?? CommittedText(reading: "", text: "", learnedCandidates: [])
+        commit.reading += reading
+        commit.text += text
+        if let learnedCandidate, learnedCandidate.isLearningTarget {
+            commit.learnedCandidates.append(learnedCandidate)
+        }
+        self.pendingCommit = commit
+    }
+
+    private func finishCommit() {
+        self.lastCommit = self.pendingCommit
+        self.pendingCommit = nil
+    }
+
+    public func discardLastCommit() {
+        self.lastCommit = nil
+    }
+
+    /// 直前の確定を取り消し、その読みを入力中に戻す。確定で学習した変換も忘れる。
+    /// - note: 呼び出し側は、確定した文字列をクライアント上で読みのmarked textに置き換えてから呼ぶ（左文脈を正しくするため）
+    @MainActor
+    @discardableResult
+    public func undoLastCommit() -> CommittedText? {
+        guard let commit = self.lastCommit, self.composingText.isEmpty else {
+            return nil
+        }
+        // 変換器には学習の取り消しがないため、確定で選んだ変換（読みのままでない語）を学習から忘れる
+        let converted = commit.learnedCandidates.flatMap(\.data).filter {
+            $0.word.toHiragana() != $0.ruby.toHiragana()
+        }
+        if !converted.isEmpty {
+            self.withConverter {
+                $0.forgetMemory(Candidate(
+                    text: converted.map(\.word).joined(),
+                    value: 0,
+                    composingCount: .surfaceCount(0),
+                    lastMid: 0,
+                    data: converted
+                ))
+            }
+        }
+        self.insertAtCursorPosition(commit.reading, inputStyle: .direct)
+        return commit
     }
 
     // サジェスト候補を設定するメソッド
@@ -1116,14 +1401,37 @@ public final class SegmentsManager {
     }
 
     // swiftlint:disable:next cyclomatic_complexity
+    /// 入力中の文字列の後ろに表示し、確定するときに一緒に確定する閉じ括弧。
+    /// 確定済みの文字列の中にカーソルを置けないアプリで、開き括弧の後に続けて打つときに使う
+    public var pendingClosingBracket: String?
+
+    /// 入力中の文字列。閉じ括弧を待っていれば末尾に足し、カーソルをその手前に置く
     public func getCurrentMarkedText(inputState: InputState) -> MarkedText {
+        let markedText = self.markedTextWithoutPendingBracket(inputState: inputState)
+        guard let closing = self.pendingClosingBracket, !markedText.text.isEmpty else {
+            return markedText
+        }
+        switch inputState {
+        case .composing, .previewing, .selecting:
+            let length = markedText.text.reduce(0) { $0 + $1.content.utf16.count }
+            let selectionRange = markedText.selectionRange.location == NSNotFound
+                ? NSRange(location: length, length: 0)
+                : markedText.selectionRange
+            return MarkedText(text: markedText.text + [.init(content: closing, focus: .none)], selectionRange: selectionRange)
+        case .none, .attachDiacritic, .replaceSuggestion, .unicodeInput:
+            return markedText
+        }
+    }
+
+    private func markedTextWithoutPendingBracket(inputState: InputState) -> MarkedText {
         switch inputState {
         case .none, .attachDiacritic:
             return MarkedText(text: [], selectionRange: .notFound)
         case .composing:
             let text = if self.lastOperation == .delete {
-                // 削除のあとは常にひらがなを示す
-                self.composingText.convertTarget
+                // 削除のあとは、削除の起点で表示していた変換を手前に残し、消している箇所はひらがなで示す
+                self.backspaceConversionView?.view(currentReading: self.composingText.convertTarget)
+                    ?? self.composingText.convertTarget
             } else if self.liveConversionEnabled,
                       self.composingText.convertTarget.count > 1,
                       let firstCandidate = self.rawCandidates?.mainResults.first {
@@ -1146,10 +1454,11 @@ public final class SegmentsManager {
                 self.selectionIndex = min(self.selectionIndex ?? 0, candidates.count - 1)
                 var afterComposingText = self.composingText
                 afterComposingText.prefixComplete(composingCount: candidates[self.selectionIndex!].composingCount)
+                let remainder = self.convertedRemainder(reading: afterComposingText.convertTarget) ?? afterComposingText.convertTarget
                 return MarkedText(
                     text: [
                         .init(content: candidates[self.selectionIndex!].text, focus: .focused),
-                        .init(content: afterComposingText.convertTarget, focus: .unfocused)
+                        .init(content: remainder, focus: .unfocused)
                     ],
                     selectionRange: NSRange(location: candidates[self.selectionIndex!].text.count, length: 0)
                 )
